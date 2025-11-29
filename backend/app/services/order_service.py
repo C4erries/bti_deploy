@@ -17,6 +17,7 @@ from app.models.order import (
     OrderStatusHistory,
 )
 from app.models.user import User
+from app.models.directory import Service
 from app.schemas.orders import CreateOrderRequest, UpdateOrderRequest, SavePlanChangesRequest
 from app.services import user_service
 from app.services.price_calculator import calculate_order_price
@@ -29,7 +30,6 @@ def create_order(db: Session, client: User, data: CreateOrderRequest) -> Order:
     order = Order(
         client_id=client.id,
         service_code=data.service_code,
-        current_department_code=None,
         district_code=data.district_code,
         house_type_code=data.house_type_code,
         title=data.title,
@@ -38,6 +38,7 @@ def create_order(db: Session, client: User, data: CreateOrderRequest) -> Order:
         status=OrderStatus.SUBMITTED,
         calculator_input=calculator_data,
     )
+    set_order_department_from_service(db, order)
     estimated, _ = calculate_order_price(db, order, calculator_data)
     order.estimated_price = estimated
     db.add(order)
@@ -57,6 +58,30 @@ def get_order(db: Session, order_id: uuid.UUID) -> Order | None:
 
 def get_client_orders(db: Session, client_id: uuid.UUID) -> list[Order]:
     return list(db.scalars(select(Order).where(Order.client_id == client_id)))
+
+
+def get_user_orders(db: Session, user_id: uuid.UUID) -> list[Order]:
+    """Получить все заказы пользователя (как клиента и как исполнителя)"""
+    # Заказы, где пользователь является клиентом
+    client_orders = db.scalars(
+        select(Order).where(Order.client_id == user_id)
+    ).all()
+    
+    # Заказы, где пользователь является исполнителем
+    executor_orders = db.scalars(
+        select(Order)
+        .join(ExecutorAssignment)
+        .where(ExecutorAssignment.executor_id == user_id)
+        .distinct()
+    ).all()
+    
+    # Объединяем и убираем дубликаты
+    all_orders = list(set(list(client_orders) + list(executor_orders)))
+    
+    # Сортируем по дате создания (новые первыми)
+    all_orders.sort(key=lambda o: o.created_at, reverse=True)
+    
+    return all_orders
 
 
 def update_order_by_client(db: Session, order: Order, data: UpdateOrderRequest) -> Order:
@@ -102,8 +127,153 @@ def add_status_history(
     return history
 
 
-def list_admin_orders(db: Session) -> list[Order]:
-    return list(db.scalars(select(Order)))
+def list_admin_orders(
+    db: Session,
+    status: OrderStatus | str | None = None,
+    executor_id: uuid.UUID | None = None,
+    department_code: str | None = None,
+) -> list[Order]:
+    """Список заказов для админ-панели с фильтрами"""
+    query = select(Order)
+    
+    if status:
+        if isinstance(status, str):
+            try:
+                status_enum = OrderStatus(status)
+            except ValueError:
+                # Если статус не валидный, игнорируем фильтр
+                status_enum = None
+        else:
+            status_enum = status
+        if status_enum:
+            query = query.where(Order.status == status_enum)
+    
+    if executor_id:
+        # Используем exists для фильтрации по исполнителю, чтобы избежать проблем с join
+        from sqlalchemy import exists
+        query = query.where(
+            exists().where(
+                ExecutorAssignment.order_id == Order.id,
+                ExecutorAssignment.executor_id == executor_id
+            )
+        )
+    
+    if department_code:
+        # Фильтруем по отделу, но только если передан непустой код
+        dept_code = department_code.strip() if isinstance(department_code, str) else str(department_code)
+        if dept_code:
+            query = query.where(Order.current_department_code == dept_code)
+    
+    try:
+        orders_list = list(db.scalars(query.order_by(Order.created_at.desc())))
+        return orders_list
+    except Exception as e:
+        # Логируем ошибку, но возвращаем пустой список вместо падения
+        import traceback
+        print(f"ERROR in list_admin_orders: {e}")
+        print(traceback.format_exc())
+        return []
+
+
+def get_admin_order_details(db: Session, order_id: uuid.UUID) -> dict | None:
+    """Получить детальную информацию о заказе для админ-панели"""
+    try:
+        order = get_order(db, order_id)
+        if not order:
+            return None
+        
+        # Клиент
+        client = None
+        try:
+            client = user_service.get_user_by_id(db, order.client_id)
+        except Exception as e:
+            import traceback
+            print(f"Error getting client for order {order_id}: {e}")
+            print(traceback.format_exc())
+        
+        # Исполнитель
+        executor = None
+        executor_assignment = None
+        try:
+            assignment = db.scalar(
+                select(ExecutorAssignment)
+                .where(ExecutorAssignment.order_id == order_id)
+                .order_by(ExecutorAssignment.assigned_at.desc())
+                .limit(1)
+            )
+            if assignment:
+                executor = user_service.get_user_by_id(db, assignment.executor_id)
+                assignment_status = str(assignment.status)
+                if hasattr(assignment.status, 'value'):
+                    assignment_status = assignment.status.value
+                executor_assignment = {
+                    "id": str(assignment.id),
+                    "executorId": str(assignment.executor_id),
+                    "status": assignment_status,
+                    "assignedAt": assignment.assigned_at.isoformat() if assignment.assigned_at else None,
+                }
+        except Exception as e:
+            import traceback
+            print(f"Error getting executor for order {order_id}: {e}")
+            print(traceback.format_exc())
+        
+        # Файлы
+        files = []
+        try:
+            files = list(db.scalars(select(OrderFile).where(OrderFile.order_id == order_id)))
+        except Exception as e:
+            import traceback
+            print(f"Error getting files for order {order_id}: {e}")
+            print(traceback.format_exc())
+        
+        # Версии планов
+        plan_versions = []
+        try:
+            plan_versions = get_plan_versions(db, order_id)
+        except Exception as e:
+            import traceback
+            print(f"Error getting plan versions for order {order_id}: {e}")
+            print(traceback.format_exc())
+        
+        # История статусов
+        status_history = []
+        try:
+            status_history = get_status_history(db, order_id)
+        except Exception as e:
+            import traceback
+            print(f"Error getting status history for order {order_id}: {e}")
+            print(traceback.format_exc())
+        
+        return {
+            "order": order,
+            "client": client,
+            "executor": executor,
+            "executorAssignment": executor_assignment,
+            "files": files,
+            "planVersions": plan_versions,
+            "statusHistory": status_history,
+        }
+    except Exception as e:
+        import traceback
+        print(f"CRITICAL ERROR in get_admin_order_details for order {order_id}: {e}")
+        print(traceback.format_exc())
+        return None
+
+
+def admin_send_for_revision(db: Session, order: Order, admin: User, comment: str) -> OrderStatusHistory:
+    """Отправить заказ на доработку"""
+    # Переводим в статус SUBMITTED для повторной обработки
+    return add_status_history(db, order, OrderStatus.SUBMITTED, admin, comment)
+
+
+def admin_approve_order(db: Session, order: Order, admin: User, comment: str | None) -> OrderStatusHistory:
+    """Утвердить заказ"""
+    return add_status_history(db, order, OrderStatus.COMPLETED, admin, comment)
+
+
+def admin_reject_order(db: Session, order: Order, admin: User, comment: str) -> OrderStatusHistory:
+    """Отклонить заказ"""
+    return add_status_history(db, order, OrderStatus.REJECTED, admin, comment)
 
 
 def assign_executor(
@@ -116,7 +286,8 @@ def assign_executor(
         status=AssignmentStatus.ASSIGNED,
     )
     if executor.executor_profile and executor.executor_profile.department_code:
-        order.current_department_code = order.current_department_code or executor.executor_profile.department_code
+        if order.current_department_code is None:
+            order.current_department_code = executor.executor_profile.department_code
     db.add(assignment)
     add_status_history(db, order, OrderStatus.EXECUTOR_ASSIGNED, assigned_by)
     db.refresh(assignment)
@@ -159,16 +330,30 @@ def executor_decline_order(db: Session, order: Order, executor: User) -> Executo
 
 
 def get_executor_orders(
-    db: Session, executor_id: uuid.UUID, status_filter: list[OrderStatus] | OrderStatus | None = None, department_code: str | None = None
+    db: Session, executor_id: uuid.UUID | None, status_filter: list[OrderStatus] | OrderStatus | None = None, department_code: str | None = None
 ) -> list[Order]:
-    query = (
-        select(Order)
-        .join(ExecutorAssignment, ExecutorAssignment.order_id == Order.id)
-        .where(
-            ExecutorAssignment.executor_id == executor_id,
-            ExecutorAssignment.status != AssignmentStatus.DECLINED,
+    """
+    Получить заказы исполнителя.
+    Если executor_id = None (для суперадмина), возвращает все заказы с назначениями.
+    """
+    if executor_id is None:
+        # Для суперадмина - все заказы с назначениями
+        query = (
+            select(Order)
+            .join(ExecutorAssignment, ExecutorAssignment.order_id == Order.id)
+            .where(ExecutorAssignment.status != AssignmentStatus.DECLINED)
         )
-    )
+    else:
+        # Для обычного исполнителя - только его заказы
+        query = (
+            select(Order)
+            .join(ExecutorAssignment, ExecutorAssignment.order_id == Order.id)
+            .where(
+                ExecutorAssignment.executor_id == executor_id,
+                ExecutorAssignment.status != AssignmentStatus.DECLINED,
+            )
+        )
+    
     if status_filter:
         if isinstance(status_filter, list):
             query = query.where(Order.status.in_(status_filter))
@@ -177,6 +362,18 @@ def get_executor_orders(
     if department_code:
         query = query.where(Order.current_department_code == department_code)
     return list(db.scalars(query))
+
+
+def set_order_department_from_service(db: Session, order: Order) -> None:
+    service = db.get(Service, order.service_code) if order.service_code else None
+    if not service or not service.department_code:
+        order.department_code = None
+        if order.current_department_code is None:
+            order.current_department_code = None
+        return
+    order.department_code = service.department_code
+    if order.current_department_code is None:
+        order.current_department_code = service.department_code
 
 
 def add_file(db: Session, order: Order, file: UploadFile, uploaded_by: User | None = None) -> OrderFile:
@@ -203,7 +400,7 @@ def get_order_files(db: Session, order_id: uuid.UUID) -> list[OrderFile]:
 
 
 def add_plan_version(
-    db: Session, order: Order, payload: SavePlanChangesRequest
+    db: Session, order: Order, payload: SavePlanChangesRequest, created_by: User | None = None
 ) -> OrderPlanVersion:
     existing = db.scalar(
         select(OrderPlanVersion).where(
@@ -214,6 +411,10 @@ def add_plan_version(
     plan_data = payload.plan.model_dump()
     if existing:
         existing.plan = plan_data
+        if payload.comment:
+            existing.comment = payload.comment
+        if created_by:
+            existing.created_by_id = created_by.id
         db.add(existing)
         plan = existing
     else:
@@ -222,11 +423,81 @@ def add_plan_version(
             version_type=payload.version_type,
             plan=plan_data,
             is_applied=True,
+            comment=payload.comment,
+            created_by_id=created_by.id if created_by else None,
         )
         db.add(plan)
     db.commit()
     db.refresh(plan)
     return plan
+
+
+def executor_approve_plan(
+    db: Session, order: Order, executor: User, comment: str | None = None
+) -> OrderPlanVersion | None:
+    """Одобрить план клиента - переводит в статус READY_FOR_APPROVAL"""
+    # Находим текущий план (MODIFIED или ORIGINAL)
+    current_plan = db.scalar(
+        select(OrderPlanVersion)
+        .where(OrderPlanVersion.order_id == order.id)
+        .order_by(OrderPlanVersion.created_at.desc())
+    )
+    
+    final_plan = None
+    if current_plan:
+        # Создаем финальную версию
+        final_plan = OrderPlanVersion(
+            order_id=order.id,
+            version_type="FINAL",
+            plan=current_plan.plan,
+            is_applied=True,
+            comment=comment or "План одобрен исполнителем",
+            created_by_id=executor.id,
+        )
+        db.add(final_plan)
+    
+    add_status_history(db, order, OrderStatus.READY_FOR_APPROVAL, executor, comment)
+    db.commit()
+    if final_plan:
+        db.refresh(final_plan)
+    db.refresh(order)
+    return final_plan
+
+
+def executor_edit_plan(
+    db: Session, order: Order, executor: User, plan_data: dict, comment: str
+) -> OrderPlanVersion:
+    """Отредактировать план - создает новую версию EXECUTOR_EDITED и отправляет клиенту на утверждение"""
+    edited_plan = OrderPlanVersion(
+        order_id=order.id,
+        version_type="EXECUTOR_EDITED",
+        plan=plan_data,
+        is_applied=False,  # Не применена, ждет утверждения клиентом
+        comment=comment,
+        created_by_id=executor.id,
+    )
+    db.add(edited_plan)
+    add_status_history(
+        db, order, OrderStatus.AWAITING_CLIENT_APPROVAL, executor,
+        f"План отредактирован исполнителем. {comment}"
+    )
+    db.commit()
+    db.refresh(edited_plan)
+    return edited_plan
+
+
+def executor_reject_plan(
+    db: Session, order: Order, executor: User, comment: str, issues: list[str] | None = None
+) -> OrderStatusHistory:
+    """Отклонить план - переводит в статус REJECTED_BY_EXECUTOR с комментарием и замечаниями"""
+    rejection_comment = comment
+    if issues:
+        rejection_comment += f"\nЗамечания:\n" + "\n".join(f"- {issue}" for issue in issues)
+    
+    history = add_status_history(
+        db, order, OrderStatus.REJECTED_BY_EXECUTOR, executor, rejection_comment
+    )
+    return history
 
 
 def get_plan_versions(db: Session, order_id: uuid.UUID) -> list[OrderPlanVersion]:

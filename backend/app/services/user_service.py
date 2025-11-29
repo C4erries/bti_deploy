@@ -1,6 +1,6 @@
 from typing import Iterable
 
-from sqlalchemy import select
+from sqlalchemy import select, exists
 from sqlalchemy.orm import Session
 
 from app.core.security import get_password_hash, verify_password
@@ -16,8 +16,27 @@ def get_user_by_id(db: Session, user_id) -> User | None:
     return db.get(User, user_id)
 
 
-def list_users(db: Session) -> list[User]:
-    return list(db.scalars(select(User)))
+def list_users(db: Session, role: str | None = None) -> list[User]:
+    """Получить список пользователей с фильтром по роли"""
+    query = select(User)
+    
+    if role:
+        role_lower = role.lower()
+        if role_lower == "client":
+            # Пользователи с client_profile
+            query = query.where(
+                exists().where(ClientProfile.user_id == User.id)
+            )
+        elif role_lower == "executor":
+            # Пользователи с executor_profile
+            query = query.where(
+                exists().where(ExecutorProfile.user_id == User.id)
+            )
+        elif role_lower == "admin":
+            # Пользователи с is_admin = True
+            query = query.where(User.is_admin == True)
+    
+    return list(db.scalars(query).distinct())
 
 
 def create_user(db: Session, data: UserCreate) -> User:
@@ -30,6 +49,7 @@ def create_user(db: Session, data: UserCreate) -> User:
         phone=data.phone,
         password_hash=get_password_hash(data.password),
         is_admin=data.is_admin,
+        is_superadmin=getattr(data, "is_superadmin", False),
     )
     db.add(user)
     db.commit()
@@ -54,6 +74,7 @@ def create_executor(db: Session, data: ExecutorCreateRequest) -> User:
             full_name=data.full_name,
             phone=data.phone,
             is_admin=data.is_admin if hasattr(data, "is_admin") and data.is_admin is not None else False,
+            is_superadmin=data.is_superadmin if hasattr(data, "is_superadmin") and data.is_superadmin is not None else False,
         ),
     )
     profile = ExecutorProfile(
@@ -75,6 +96,10 @@ def update_user_admin(db: Session, user: User, data: UserUpdateAdmin) -> User:
         user.phone = data.phone
     if data.is_admin is not None:
         user.is_admin = data.is_admin
+    if data.is_superadmin is not None:
+        user.is_superadmin = data.is_superadmin
+    if data.is_blocked is not None:
+        user.is_blocked = data.is_blocked
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -92,11 +117,18 @@ def ensure_client_profile(db: Session, user: User) -> ClientProfile:
 
 
 def verify_user_credentials(db: Session, email: str, password: str) -> User | None:
+    """Проверка учетных данных пользователя. Возвращает None если неверные данные или пользователь заблокирован."""
     user = get_user_by_email(db, email)
     if not user:
         return None
+    
+    # Проверка блокировки должна быть ДО проверки пароля для безопасности
+    if user.is_blocked:
+        return None
+    
     if not verify_password(password, user.password_hash):
         return None
+    
     return user
 
 

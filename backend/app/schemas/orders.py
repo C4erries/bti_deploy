@@ -49,6 +49,9 @@ class OrderPlanVersion(BaseModel):
     order_id: uuid.UUID = Field(alias="orderId")
     version_type: str = Field(alias="versionType")
     plan: Plan
+    comment: str | None = None
+    created_by_id: uuid.UUID | None = Field(default=None, alias="createdById")
+    created_at: datetime | None = Field(default=None, alias="createdAt")
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
@@ -56,6 +59,53 @@ class OrderPlanVersion(BaseModel):
 class SavePlanChangesRequest(BaseModel):
     version_type: str = Field(alias="versionType")
     plan: Plan
+    comment: str | None = None  # Комментарий при сохранении изменений
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ParsePlanResultRequest(BaseModel):
+    """Запрос на сохранение результата парсинга плана от нейронки"""
+    file_id: uuid.UUID = Field(alias="fileId", description="ID загруженного файла, который обрабатывался")
+    plan: Plan = Field(description="Результат парсинга - структурированный план")
+    confidence: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Уверенность распознавания (0.0 - 1.0)"
+    )
+    errors: list[str] = Field(
+        default_factory=list,
+        description="Список ошибок или предупреждений при распознавании"
+    )
+    processing_time_ms: int | None = Field(
+        default=None,
+        alias="processingTimeMs",
+        description="Время обработки в миллисекундах"
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ExecutorApprovePlanRequest(BaseModel):
+    """Запрос на одобрение плана исполнителем"""
+    comment: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ExecutorEditPlanRequest(BaseModel):
+    """Запрос на редактирование плана исполнителем"""
+    plan: Plan
+    comment: str  # Обязательный комментарий с описанием изменений
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ExecutorRejectPlanRequest(BaseModel):
+    """Запрос на отклонение плана исполнителем"""
+    comment: str  # Обязательный комментарий с замечаниями
+    issues: list[str] | None = None  # Список замечаний
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -143,6 +193,72 @@ class AdminUpdateOrderRequest(BaseModel):
     current_department_code: str | None = Field(default=None, alias="currentDepartmentCode")
     estimated_price: float | None = Field(default=None, alias="estimatedPrice")
     total_price: float | None = Field(default=None, alias="totalPrice")
+    planned_visit_at: datetime | None = Field(default=None, alias="plannedVisitAt", description="Планируемая дата выезда")
+    completed_at: datetime | None = Field(default=None, alias="completedAt", description="Дата завершения заказа")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AdminOrderListItem(BaseModel):
+    """Расширенная информация о заказе для админ-панели"""
+    id: uuid.UUID
+    status: str
+    title: str
+    description: str | None = None
+    service_code: int = Field(alias="serviceCode")
+    service_title: str | None = Field(default=None, alias="serviceTitle")
+    client_id: uuid.UUID = Field(alias="clientId")
+    client_name: str | None = Field(default=None, alias="clientName")
+    executor_id: uuid.UUID | None = Field(default=None, alias="executorId")
+    executor_name: str | None = Field(default=None, alias="executorName")
+    current_department_code: str | None = Field(default=None, alias="currentDepartmentCode")
+    total_price: float | None = Field(default=None, alias="totalPrice")
+    files_count: int = Field(default=0, alias="filesCount")
+    created_at: datetime = Field(alias="createdAt")
+    planned_visit_at: datetime | None = Field(default=None, alias="plannedVisitAt")
+    completed_at: datetime | None = Field(default=None, alias="completedAt")
+    executor_comment: str | None = Field(default=None, alias="executorComment", description="Последний комментарий исполнителя")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AdminOrderDetails(BaseModel):
+    """Детальная информация о заказе для админ-панели"""
+    order: Order
+    client: User | None = None
+    executor: User | None = None
+    executor_assignment: dict | None = Field(default=None, alias="executorAssignment")
+    files: list[OrderFile] = Field(default_factory=list)
+    plan_versions: list[OrderPlanVersion] = Field(default_factory=list, alias="planVersions")
+    status_history: list[OrderStatusHistoryItem] = Field(default_factory=list, alias="statusHistory")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AdminSendForRevisionRequest(BaseModel):
+    """Запрос на отправку заказа на доработку"""
+    comment: str  # Обязательный комментарий с указанием причин
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AdminApproveOrderRequest(BaseModel):
+    """Запрос на утверждение заказа"""
+    comment: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AdminRejectOrderRequest(BaseModel):
+    """Запрос на отклонение заказа"""
+    comment: str  # Обязательный комментарий с причинами отклонения
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AdminAddCommentRequest(BaseModel):
+    """Запрос на добавление комментария к заказу"""
+    comment: str
 
     model_config = ConfigDict(populate_by_name=True)
 
