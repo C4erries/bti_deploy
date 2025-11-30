@@ -11,14 +11,12 @@ import {
   subtleButtonClass,
   textareaClass,
 } from '../components/ui';
-import type { ClientChatThread, Service } from '../types';
+import type { ClientChatThread } from '../types';
 
 const normalizeThread = (t: Partial<ClientChatThread> & Record<string, any>): ClientChatThread => ({
   chatId: t.chatId || (t as any).id || (t as any).orderId || crypto.randomUUID(),
   orderId: t.orderId ?? (t as any).order_id ?? null,
-  serviceCode: Number(t.serviceCode ?? 0),
-  serviceTitle: t.serviceTitle ?? (t as any).title ?? 'Без названия',
-  orderStatus: t.orderStatus,
+  orderStatus: t.orderStatus ?? (t as any).order_status ?? null,
   lastMessageText: t.lastMessageText ?? (t as any).lastMessage ?? null,
   updatedAt: t.updatedAt ?? (t as any).createdAt ?? new Date().toISOString(),
 });
@@ -29,21 +27,20 @@ const SidebarItem = ({ chat, isActive }: { chat: ClientChatThread; isActive: boo
     className={`block rounded-md px-3 py-2 text-sm hover:bg-slate-200 ${isActive ? 'bg-slate-200' : ''}`}
   >
     <div className="flex items-center justify-between">
-      <span className="font-medium">{chat.serviceTitle}</span>
+      <span className="font-medium">Чат {chat.orderId ? `#${chat.orderId.slice(0, 8)}` : ''}</span>
       {chat.orderStatus && <span className={badgeClass}>{chat.orderStatus}</span>}
     </div>
-    <p className="text-xs text-slate-600 truncate">{chat.lastMessageText || 'Новый чат'}</p>
+    <p className="text-xs text-slate-600 truncate">{chat.lastMessageText || 'Нет сообщений'}</p>
   </NavLink>
 );
 
 const ClientChatShell = () => {
   const { token } = useAuth();
   const [chats, setChats] = useState<ClientChatThread[]>([]);
-  const [services, setServices] = useState<Service[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showNew, setShowNew] = useState(false);
-  const [newChat, setNewChat] = useState({ serviceCode: '', title: '', firstMessageText: '' });
+  const [newChat, setNewChat] = useState({ title: '', firstMessageText: '' });
   const navigate = useNavigate();
   const params = useParams();
 
@@ -51,7 +48,6 @@ const ClientChatShell = () => {
 
   useEffect(() => {
     void refreshChats();
-    void loadServices();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
@@ -65,17 +61,8 @@ const ClientChatShell = () => {
     }
   };
 
-  const loadServices = async () => {
-    try {
-      const data = await apiFetch<Service[]>('/services');
-      setServices(data);
-    } catch {
-      // ignore
-    }
-  };
-
   const createChat = async () => {
-    if (!token || !newChat.serviceCode) return;
+    if (!token) return;
     setLoading(true);
     try {
       const created = await apiFetch<ClientChatThread>(
@@ -83,9 +70,8 @@ const ClientChatShell = () => {
         {
           method: 'POST',
           data: {
-            serviceCode: Number(newChat.serviceCode),
             title: newChat.title || undefined,
-            firstMessageText: newChat.firstMessageText || undefined,
+            firstMessage: newChat.firstMessageText || undefined,
           },
         },
         token,
@@ -93,7 +79,7 @@ const ClientChatShell = () => {
       const normalized = normalizeThread(created);
       setChats((prev) => [normalized, ...prev]);
       setShowNew(false);
-      setNewChat({ serviceCode: '', title: '', firstMessageText: '' });
+      setNewChat({ title: '', firstMessageText: '' });
       navigate(`/client/chat/${normalized.chatId}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Не удалось создать чат');
@@ -108,7 +94,7 @@ const ClientChatShell = () => {
         <div className="flex items-center justify-between">
           <h3 className={sectionTitleClass}>Чаты</h3>
           <button className={subtleButtonClass} onClick={() => void refreshChats()}>
-            ↻
+            Обновить
           </button>
         </div>
         <button className={`${buttonClass} mt-3 w-full justify-center`} onClick={() => setShowNew((v) => !v)}>
@@ -118,22 +104,7 @@ const ClientChatShell = () => {
           <div className={`${cardClass} mt-3 bg-slate-50`}>
             <div className="space-y-2">
               <label className="text-sm text-slate-700">
-                Услуга
-                <select
-                  className={`${inputClass} mt-1`}
-                  value={newChat.serviceCode}
-                  onChange={(e) => setNewChat((p) => ({ ...p, serviceCode: e.target.value }))}
-                >
-                  <option value="">Выберите</option>
-                  {services.map((s) => (
-                    <option key={s.code} value={s.code}>
-                      {s.title}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="text-sm text-slate-700">
-                Заголовок (опционально)
+                Название (необязательно)
                 <input
                   className={`${inputClass} mt-1`}
                   value={newChat.title}
@@ -141,21 +112,15 @@ const ClientChatShell = () => {
                 />
               </label>
               <label className="text-sm text-slate-700">
-                Первое сообщение (опционально)
+                Первое сообщение/вопрос
                 <textarea
                   className={`${textareaClass} mt-1`}
                   rows={3}
                   value={newChat.firstMessageText}
-                  onChange={(e) =>
-                    setNewChat((p) => ({ ...p, firstMessageText: e.target.value }))
-                  }
+                  onChange={(e) => setNewChat((p) => ({ ...p, firstMessageText: e.target.value }))}
                 />
               </label>
-              <button
-                className={buttonClass}
-                onClick={() => void createChat()}
-                disabled={loading || !newChat.serviceCode}
-              >
+              <button className={buttonClass} onClick={() => void createChat()} disabled={loading}>
                 Создать
               </button>
             </div>
@@ -167,24 +132,21 @@ const ClientChatShell = () => {
             <SidebarItem key={chat.chatId} chat={chat} isActive={chat.chatId === activeChatId} />
           ))}
           {chats.length === 0 && (
-            <p className="text-sm text-slate-600">Нет чатов. Создайте новый чат.</p>
+            <p className="text-sm text-slate-600">Чаты отсутствуют. Создайте новый чат.</p>
           )}
         </div>
 
         <div className="mt-6 border-t border-slate-200 pt-3 text-sm">
-          <p className="font-semibold text-slate-800">Другие разделы</p>
+          <p className="font-semibold text-slate-800">Быстрые действия</p>
           <div className="mt-2 flex flex-col gap-2">
             <Link className={subtleButtonClass} to="/client/orders">
               Мои заказы
-            </Link>
-            <Link className={subtleButtonClass} to="/client/services">
-              Каталог услуг
             </Link>
             <Link className={subtleButtonClass} to="/client/orders/new">
               Создать заказ
             </Link>
             <Link className={subtleButtonClass} to="/client/calculator">
-              ??????????? ?????????
+              Калькулятор
             </Link>
           </div>
         </div>

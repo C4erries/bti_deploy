@@ -51,9 +51,9 @@ class OrderPlanVersion(BaseModel):
     plan: Plan
     comment: str | None = None
     created_by_id: uuid.UUID | None = Field(default=None, alias="createdById")
-    created_at: datetime | None = Field(default=None, alias="createdAt")
+    created_at: datetime = Field(alias="createdAt")
 
-    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True, extra="forbid")
 
 
 class SavePlanChangesRequest(BaseModel):
@@ -61,7 +61,7 @@ class SavePlanChangesRequest(BaseModel):
     plan: Plan
     comment: str | None = None  # Комментарий при сохранении изменений
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
 
 class ParsePlanResultRequest(BaseModel):
@@ -131,10 +131,12 @@ class AiAnalysis(BaseModel):
 
 
 class OrderStatusHistoryItem(BaseModel):
-    old_status: str | None = Field(default=None, alias="oldStatus")
+    id: uuid.UUID
+    order_id: uuid.UUID = Field(alias="orderId")
     status: str
-    changed_by_user_id: uuid.UUID | None = Field(default=None, alias="changedByUserId")
-    changed_at: datetime = Field(alias="changedAt")
+    changed_by_id: uuid.UUID | None = Field(default=None, alias="changedByUserId")
+    changed_by: dict | None = Field(default=None, alias="changedBy", description="Информация о пользователе, изменившем статус")
+    created_at: datetime = Field(alias="changedAt")
     comment: str | None = None
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
@@ -143,7 +145,6 @@ class OrderStatusHistoryItem(BaseModel):
 class Order(BaseModel):
     id: uuid.UUID
     client_id: uuid.UUID = Field(alias="clientId")
-    service_code: int = Field(alias="serviceCode")
     status: OrderStatus
     title: str
     description: str | None = None
@@ -166,7 +167,6 @@ class Order(BaseModel):
 
 
 class CreateOrderRequest(BaseModel):
-    service_code: int = Field(alias="serviceCode")
     title: str
     description: str | None = None
     address: str | None = None
@@ -205,8 +205,6 @@ class AdminOrderListItem(BaseModel):
     status: str
     title: str
     description: str | None = None
-    service_code: int = Field(alias="serviceCode")
-    service_title: str | None = Field(default=None, alias="serviceTitle")
     client_id: uuid.UUID = Field(alias="clientId")
     client_name: str | None = Field(default=None, alias="clientName")
     executor_id: uuid.UUID | None = Field(default=None, alias="executorId")
@@ -266,7 +264,7 @@ class AdminAddCommentRequest(BaseModel):
 class ExecutorOrderListItem(BaseModel):
     id: uuid.UUID
     status: str
-    service_title: str = Field(alias="serviceTitle")
+    title: str
     total_price: float | None = Field(default=None, alias="totalPrice")
     created_at: datetime = Field(alias="createdAt")
     complexity: str | None = None
@@ -339,6 +337,12 @@ class ExecutorScheduleVisitRequest(BaseModel):
     start_time: datetime = Field(alias="startTime")
     end_time: datetime = Field(alias="endTime")
     location: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class RecognizePlanRequest(BaseModel):
+    file_id: uuid.UUID = Field(alias="fileId")
 
     model_config = ConfigDict(populate_by_name=True)
 

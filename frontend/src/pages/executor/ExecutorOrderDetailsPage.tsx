@@ -31,13 +31,13 @@ const ExecutorOrderDetailsPage = () => {
   const [currentPlan, setCurrentPlan] = useState<OrderPlanVersion | null>(null);
   const [planData, setPlanData] = useState<PlanGeometry | null>(null);
   const [planVersions, setPlanVersions] = useState<OrderPlanVersion[]>([]);
-  const [isEditing, setIsEditing] = useState(false);
   const [editComment, setEditComment] = useState('');
   const [rejectComment, setRejectComment] = useState('');
   const [rejectIssues, setRejectIssues] = useState<string[]>(['']);
   const [showApproveModal, setShowApproveModal] = useState(false);
   const [showRejectModal, setShowRejectModal] = useState(false);
   const [approveComment, setApproveComment] = useState('');
+  const [, setIsEditing] = useState(false);
 
   useEffect(() => {
     if (token && orderId) {
@@ -75,7 +75,7 @@ const ExecutorOrderDetailsPage = () => {
     }
   };
 
-  const loadPlan = async (versionType?: string) => {
+  const loadPlan = async (versionType?: OrderPlanVersion['versionType']) => {
     if (!token || !orderId) return;
     try {
       const query = versionType ? `?version=${versionType}` : '';
@@ -189,7 +189,7 @@ const ExecutorOrderDetailsPage = () => {
         {
           method: 'POST',
           data: {
-            versionType: 'EXECUTOR_EDITED',
+            versionType: 'MODIFIED',
             plan: planData,
             comment: editComment || 'Изменения в плане',
           },
@@ -262,7 +262,7 @@ const ExecutorOrderDetailsPage = () => {
         <div className={cardClass}>
           <div className="flex flex-wrap gap-2">
             <span className={badgeClass}>Статус: {data.order.status}</span>
-            <span className={badgeClass}>Услуга: {data.order.serviceCode}</span>
+            <span className={badgeClass}>Услуга: {data.order.districtCode || '?'}</span>
             {data.order.complexity && (
               <span className={badgeClass}>Сложность: {data.order.complexity}</span>
             )}
@@ -352,7 +352,9 @@ const ExecutorOrderDetailsPage = () => {
                   <select
                     className={`${inputClass} mt-1`}
                     value={currentPlan?.versionType || ''}
-                    onChange={(e) => void loadPlan(e.target.value)}
+                    onChange={(e) =>
+                      void loadPlan(e.target.value as OrderPlanVersion['versionType'])
+                    }
                   >
                     {planVersions.map((v) => (
                       <option key={v.id} value={v.versionType}>

@@ -1,4 +1,7 @@
+import math
 import uuid
+from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -17,6 +20,8 @@ from app.schemas.orders import (
     SavePlanChangesRequest,
     ParsePlanResultRequest,
     AiAnalysis,
+    AiRisk,
+    RecognizePlanRequest,
 )
 from app.schemas.plan_responses import (
     Plan2DResponse,
@@ -26,7 +31,9 @@ from app.schemas.plan_responses import (
 )
 from app.models.order import OrderFile as OrderFileModel
 from app.core.config import settings
-from app.services import order_service
+from app.services import order_service, plan_recognition_service, ai_rule_service
+from app.services.gemini_client import generate_json
+from app.services.plan_description import summarize_plan
 
 class HTTPValidationError(BaseModel):
     detail: list[dict] | None = None
@@ -37,6 +44,255 @@ router = APIRouter(prefix="/client", tags=["Client"])
 def _ensure_ownership(order, user_id: uuid.UUID):
     if order.client_id != user_id:
         raise HTTPException(status_code=403, detail="Not your order")
+
+
+def _split_wall_segments(plan: dict) -> dict:
+    """Split walls with openings into separate wall elements without openings."""
+    if not plan:
+        return plan
+    meta = plan.get("meta", {}) or {}
+    scale = meta.get("scale") or {}
+    px_per_meter = scale.get("px_per_meter") or scale.get("pxPerMeter") or 1
+    try:
+        px_per_meter = float(px_per_meter)
+        if px_per_meter <= 0:
+            px_per_meter = 1
+    except Exception:
+        px_per_meter = 1
+
+    elements = []
+    for elem in plan.get("elements", []):
+        if elem.get("type") != "wall":
+            elements.append(elem)
+            continue
+        geom = elem.get("geometry") or {}
+        openings = geom.get("openings") or []
+        points = geom.get("points") or []
+        if geom.get("kind") != "segment" or len(points) != 4 or not openings:
+            elements.append(elem)
+            continue
+
+        x1, y1, x2, y2 = points
+        dx = x2 - x1
+        dy = y2 - y1
+        length_px = math.hypot(dx, dy)
+        if length_px == 0:
+            elements.append(elem)
+            continue
+        length_m = length_px / px_per_meter if px_per_meter else length_px
+
+        def point_at(offset_m: float) -> tuple[float, float]:
+            offset_px = offset_m * px_per_meter
+            ratio = offset_px / length_px
+            return x1 + dx * ratio, y1 + dy * ratio
+
+        openings_sorted = sorted(openings, key=lambda o: o.get("from_m", 0))
+        segments: list[tuple[float, float]] = []
+        cursor = 0.0
+        for op in openings_sorted:
+            start = max(0.0, float(op.get("from_m", 0)))
+            end = max(start, float(op.get("to_m", start)))
+            start = min(start, length_m)
+            end = min(end, length_m)
+            if start > cursor:
+                segments.append((cursor, start))
+            cursor = max(cursor, end)
+        if cursor < length_m:
+            segments.append((cursor, length_m))
+
+        if not segments:
+            elements.append(elem)
+            continue
+
+        for idx, (seg_start, seg_end) in enumerate(segments):
+            if seg_end - seg_start <= 0:
+                continue
+            sx, sy = point_at(seg_start)
+            ex, ey = point_at(seg_end)
+            new_elem = deepcopy(elem)
+            new_elem["id"] = f"{elem.get('id')}_seg{idx+1}"
+            new_elem_geom = deepcopy(geom)
+            new_elem_geom["points"] = [sx, sy, ex, ey]
+            new_elem_geom["openings"] = None
+            new_elem["geometry"] = new_elem_geom
+            elements.append(new_elem)
+
+    plan_copy = deepcopy(plan)
+    plan_copy["elements"] = elements
+    return plan_copy
+
+
+def _apply_split_to_plan_version(plan_version):
+    if not plan_version or not getattr(plan_version, "plan", None):
+        return plan_version
+    plan_version.plan = _split_wall_segments(plan_version.plan)
+    return plan_version
+
+
+def _format_rules_text(rules: list) -> str:
+    if not rules:
+        return "Правила для анализа не заданы."
+    lines = []
+    for rule in rules[:5]:
+        title = getattr(rule, "name", None) or "Правило"
+        description = getattr(rule, "description", None) or getattr(rule, "trigger_condition", "") or ""
+        risk_type = getattr(rule, "risk_type", None)
+        severity = getattr(rule, "severity", None)
+        parts = [f"- {title}: {description}"]
+        extra = []
+        if risk_type:
+            extra.append(f"тип риска {getattr(risk_type, 'value', risk_type)}")
+        if severity:
+            extra.append(f"серьезность {severity}")
+        if extra:
+            parts.append(f"({', '.join(extra)})")
+        lines.append(" ".join(parts).strip())
+    return "\n".join(lines)
+
+
+def _severity_from_label(label: str | None) -> int | None:
+    if not label:
+        return None
+    mapping = {"low": 1, "medium": 2, "high": 4, "critical": 5}
+    return mapping.get(label.lower())
+
+
+def _map_ai_risk(risk_dict: dict) -> AiRisk:
+    severity = risk_dict.get("severity")
+    if severity is None:
+        severity = _severity_from_label(risk_dict.get("severity_str"))
+    risk_type = risk_dict.get("type") or "TECHNICAL"
+    description = risk_dict.get("description") or "Risk details are not available"
+    return AiRisk(
+        type=risk_type,
+        description=description,
+        severity=severity,
+        zone=risk_dict.get("zone"),
+    )
+
+
+def _derive_decision_status(risks: list[AiRisk]) -> str:
+    if any(r.severity and r.severity >= 4 for r in risks):
+        return "FORBIDDEN"
+    if any(r.severity and r.severity >= 3 for r in risks):
+        return "NEEDS_APPROVAL"
+    if risks:
+        return "ALLOWED_WITH_WARNINGS"
+    return "ALLOWED"
+
+
+def _collect_order_context(order) -> dict:
+    status_value = order.status.value if hasattr(order.status, "value") else str(order.status)
+    context = {
+        "order_id": str(order.id),
+        "order_title": order.title,
+        "order_status": status_value,
+    }
+    if order.district_code:
+        context["district_code"] = order.district_code
+    if order.house_type_code:
+        context["house_type_code"] = order.house_type_code
+    if order.address:
+        context["address"] = order.address
+    if getattr(order, "area", None):
+        context["area"] = order.area
+    return context
+
+
+def _get_latest_plan_data(db: Session, order_id: uuid.UUID) -> dict | None:
+    versions = order_service.get_plan_versions(db, order_id)
+    if not versions:
+        return None
+    latest = versions[-1]
+    latest = _apply_split_to_plan_version(latest)
+    return latest.plan
+
+
+async def _build_ai_analysis(db: Session, order, persist: bool = False) -> AiAnalysis:
+    plan_data = _get_latest_plan_data(db, order.id)
+    if not plan_data:
+        summary = order.ai_decision_summary or "Plan data not available for analysis"
+        decision_status = order.ai_decision_status or "UNKNOWN"
+        analysis = AiAnalysis(
+            id=uuid.uuid4(),
+            orderId=order.id,
+            decisionStatus=decision_status,
+            summary=summary,
+            risks=None,
+            legalWarnings=None,
+            financialWarnings=None,
+            rawResponse=None,
+        )
+        if persist:
+            order.ai_decision_status = decision_status
+            order.ai_decision_summary = summary
+            db.add(order)
+            db.commit()
+            db.refresh(order)
+        return analysis
+
+    rules = ai_rule_service.list_rules(db, is_enabled=True)
+    rules_text = _format_rules_text(rules)
+    order_context = _collect_order_context(order)
+    plan_description = summarize_plan(plan_data)
+
+    system_prompt = (
+        "Ты эксперт по перепланировкам и БТИ. "
+        "Анализируй план квартиры, оценивай риски и формируй структурированный вывод."
+    )
+    prompt = (
+        f"Данные заказа:\n"
+        f"ID: {order_context.get('order_id')}\n"
+        f"Статус: {order_context.get('order_status')}\n"
+        f"Тип дома: {order_context.get('house_type_code', 'не указан')}\n"
+        f"Округ: {order_context.get('district_code', 'не указан')}\n"
+        f"Адрес: {order_context.get('address', 'не указан')}\n\n"
+        f"Описание плана:\n{plan_description}\n\n"
+        f"Правила и ограничения:\n{rules_text}\n\n"
+        "Сформируй краткое резюме и список рисков по категориям "
+        "(TECHNICAL, LEGAL, FINANCIAL, OPERATIONAL). "
+        "Ответ верни строго в JSON с полями: summary (str), risks (list of objects: "
+        "type, description, severity(1-5), zone(optional))."
+    )
+
+    result = await generate_json(
+        system=system_prompt,
+        prompt=prompt,
+        temperature=settings.analysis_temperature,
+    )
+
+    risks_dicts = result.get("risks") if isinstance(result, dict) else []
+    summary = result.get("summary") if isinstance(result, dict) else None
+
+    ai_risks = [_map_ai_risk(r) for r in risks_dicts] if risks_dicts else []
+    decision_status = result.get("decisionStatus") if isinstance(result, dict) else None
+    derived_status = _derive_decision_status(ai_risks)
+    if derived_status:
+        decision_status = derived_status
+    if not decision_status:
+        decision_status = order.ai_decision_status or "UNKNOWN"
+    if not summary:
+        summary = "Анализ плана не дал результатов."
+
+    analysis = AiAnalysis(
+        id=uuid.uuid4(),
+        orderId=order.id,
+        decisionStatus=decision_status,
+        summary=summary,
+        risks=ai_risks or None,
+        legalWarnings=None,
+        financialWarnings=None,
+        rawResponse=result if isinstance(result, dict) else None,
+    )
+
+    if persist:
+        order.ai_decision_status = decision_status
+        order.ai_decision_summary = summary
+        db.add(order)
+        db.commit()
+        db.refresh(order)
+
+    return analysis
 
 
 @router.get("/orders", response_model=list[Order])
@@ -136,10 +392,12 @@ def get_plan_versions(
     if version:
         match = next((v for v in versions if v.version_type.lower() == version.lower()), None)
         if match:
+            match = _apply_split_to_plan_version(match)
             return OrderPlanVersion.model_validate(match)
     if not versions:
         raise HTTPException(status_code=404, detail="Plan not found")
-    return OrderPlanVersion.model_validate(versions[-1])
+    latest = _apply_split_to_plan_version(versions[-1])
+    return OrderPlanVersion.model_validate(latest)
 
 
 @router.get("/orders/{order_id}/plan/2d", response_model=Plan2DResponse, summary="Получить 2D план с полной геометрией")
@@ -178,6 +436,8 @@ def get_plan_2d(
         if creator:
             created_by_name = creator.full_name
     
+    plan_version = _apply_split_to_plan_version(plan_version)
+
     return Plan2DResponse(
         orderId=order_id,
         versionType=plan_version.version_type,
@@ -210,6 +470,7 @@ def get_plan_before_after(
     
     for v in versions:
         if v.version_type.upper() == "ORIGINAL":
+            v = _apply_split_to_plan_version(v)
             created_by_name = None
             if v.created_by_id:
                 from app.services import user_service
@@ -226,6 +487,7 @@ def get_plan_before_after(
                 createdBy=created_by_name,
             )
         elif v.version_type.upper() in ["MODIFIED", "EXECUTOR_EDITED"]:
+            v = _apply_split_to_plan_version(v)
             created_by_name = None
             if v.created_by_id:
                 from app.services import user_service
@@ -283,6 +545,7 @@ def get_plan_diff(
     modified_response = None
     
     if original_plan:
+        original_plan = _apply_split_to_plan_version(original_plan)
         created_by_name = None
         if original_plan.created_by_id:
             from app.services import user_service
@@ -300,6 +563,7 @@ def get_plan_diff(
         )
     
     if modified_plan:
+        modified_plan = _apply_split_to_plan_version(modified_plan)
         created_by_name = None
         if modified_plan.created_by_id:
             from app.services import user_service
@@ -393,6 +657,7 @@ def export_plan(
         plan_version = versions[-1]  # Последняя версия
     
     # Формируем метаданные
+    plan_version = _apply_split_to_plan_version(plan_version)
     metadata = {
         "versionType": plan_version.version_type,
         "versionId": str(plan_version.id),
@@ -462,6 +727,8 @@ def parse_plan_result(
     # Создаем версию плана (created_by может быть None, если это автоматический парсинг)
     version = order_service.add_plan_version(db, order, plan_request, created_by=current_user)
     
+    version = _apply_split_to_plan_version(version)
+    version = _apply_split_to_plan_version(version)
     return OrderPlanVersion.model_validate(version)
 
 
@@ -477,6 +744,7 @@ def add_plan_change(
         raise HTTPException(status_code=404, detail="Order not found")
     _ensure_ownership(order, current_user.id)
     version = order_service.add_plan_version(db, order, payload, created_by=current_user)
+    version = _apply_split_to_plan_version(version)
     return OrderPlanVersion.model_validate(version)
 
 
@@ -490,28 +758,51 @@ def get_status_history(
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     _ensure_ownership(order, current_user.id)
-    history = order_service.get_status_history(db, order_id)
-    return [OrderStatusHistoryItem.model_validate(h) for h in history]
+    
+    try:
+        history = order_service.get_status_history(db, order_id)
+        result = []
+        for h in history:
+            try:
+                history_item = OrderStatusHistoryItem.model_validate(h)
+                # Если есть changed_by, добавляем информацию о пользователе
+                if h.changed_by:
+                    from app.schemas.user import User
+                    history_item.changed_by = User.model_validate(h.changed_by).model_dump()
+                result.append(history_item)
+            except Exception as e:
+                print(f"Error validating history item {h.id}: {e}")
+                # Создаем упрощенную версию
+                result.append(OrderStatusHistoryItem(
+                    id=h.id,
+                    orderId=h.order_id,
+                    status=h.status.value if hasattr(h.status, 'value') else str(h.status),
+                    changedByUserId=h.changed_by_id,
+                    changedAt=h.created_at,
+                    comment=h.comment
+                ))
+        return result
+    except Exception as e:
+        import traceback
+        print(f"Error in get_status_history (client): {e}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error retrieving status history: {str(e)}")
 
 
 
 
 @router.post("/orders/{order_id}/ai/analyze", response_model=AiAnalysis)
-def trigger_ai_analyze(
+async def trigger_ai_analyze(
     order_id: uuid.UUID,
     db: Session = Depends(get_db_session),
     current_user=Depends(get_current_user),
 ):
-    analysis = AiAnalysis(
-        id=uuid.uuid4(),
-        orderId=order_id,
-        decisionStatus="UNKNOWN",
-        summary=None,
-        risks=[],
-        legalWarnings=None,
-        financialWarnings=None,
-        rawResponse=None,
-    )
+    order = order_service.get_order(db, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    _ensure_ownership(order, current_user.id)
+
+    analysis = await _build_ai_analysis(db, order, persist=True)
     return analysis
 
 
@@ -542,19 +833,48 @@ def download_file(
 
 
 @router.get("/orders/{order_id}/ai/analysis", response_model=AiAnalysis)
-def get_ai_analysis(
+async def get_ai_analysis(
     order_id: uuid.UUID,
     db: Session = Depends(get_db_session),
     current_user=Depends(get_current_user),
 ):
-    analysis = AiAnalysis(
-        id=uuid.uuid4(),
-        orderId=order_id,
-        decisionStatus="UNKNOWN",
-        summary=None,
-        risks=[],
-        legalWarnings=None,
-        financialWarnings=None,
-        rawResponse=None,
-    )
+    order = order_service.get_order(db, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    _ensure_ownership(order, current_user.id)
+    analysis = await _build_ai_analysis(db, order, persist=False)
     return analysis
+
+
+@router.post(
+    "/orders/{order_id}/plan/recognize",
+    response_model=OrderPlanVersion,
+    summary="Распознать план по загруженному файлу",
+)
+def recognize_plan(
+    order_id: uuid.UUID,
+    payload: RecognizePlanRequest,
+    db: Session = Depends(get_db_session),
+    current_user=Depends(get_current_user),
+):
+    order = order_service.get_order(db, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    _ensure_ownership(order, current_user.id)
+
+    file = db.get(OrderFileModel, payload.file_id)
+    if not file or file.order_id != order_id:
+        raise HTTPException(status_code=404, detail="File not found for this order")
+
+    plan = plan_recognition_service.get_plan_by_filename(file.filename)
+    if not plan:
+        raise HTTPException(status_code=422, detail="No plan template found for this filename")
+
+    existing_versions = order_service.get_plan_versions(db, order_id)
+    has_original = any(v.version_type.upper() == "ORIGINAL" for v in existing_versions)
+    version_type = "MODIFIED" if has_original else "ORIGINAL"
+    comment = f"Распознан план по изображению {file.filename}"
+
+    plan_request = SavePlanChangesRequest(versionType=version_type, plan=plan, comment=comment)
+    version = order_service.add_plan_version(db, order, plan_request, created_by=current_user)
+    return OrderPlanVersion.model_validate(version)

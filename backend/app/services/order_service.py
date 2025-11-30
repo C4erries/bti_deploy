@@ -17,7 +17,6 @@ from app.models.order import (
     OrderStatusHistory,
 )
 from app.models.user import User
-from app.models.directory import Service
 from app.schemas.orders import CreateOrderRequest, UpdateOrderRequest, SavePlanChangesRequest
 from app.services import user_service
 from app.services.price_calculator import calculate_order_price
@@ -29,7 +28,6 @@ def create_order(db: Session, client: User, data: CreateOrderRequest) -> Order:
     calculator_data = data.calculator_input or {}
     order = Order(
         client_id=client.id,
-        service_code=data.service_code,
         district_code=data.district_code,
         house_type_code=data.house_type_code,
         title=data.title,
@@ -38,7 +36,6 @@ def create_order(db: Session, client: User, data: CreateOrderRequest) -> Order:
         status=OrderStatus.SUBMITTED,
         calculator_input=calculator_data,
     )
-    set_order_department_from_service(db, order)
     estimated, _ = calculate_order_price(db, order, calculator_data)
     order.estimated_price = estimated
     db.add(order)
@@ -364,18 +361,6 @@ def get_executor_orders(
     return list(db.scalars(query))
 
 
-def set_order_department_from_service(db: Session, order: Order) -> None:
-    service = db.get(Service, order.service_code) if order.service_code else None
-    if not service or not service.department_code:
-        order.department_code = None
-        if order.current_department_code is None:
-            order.current_department_code = None
-        return
-    order.department_code = service.department_code
-    if order.current_department_code is None:
-        order.current_department_code = service.department_code
-
-
 def add_file(db: Session, order: Order, file: UploadFile, uploaded_by: User | None = None) -> OrderFile:
     storage_dir = Path(settings.static_root) / "orders" / str(order.id)
     storage_dir.mkdir(parents=True, exist_ok=True)
@@ -511,13 +496,21 @@ def get_plan_versions(db: Session, order_id: uuid.UUID) -> list[OrderPlanVersion
 
 
 def get_status_history(db: Session, order_id: uuid.UUID) -> list[OrderStatusHistory]:
-    return list(
-        db.scalars(
-            select(OrderStatusHistory)
-            .where(OrderStatusHistory.order_id == order_id)
-            .order_by(OrderStatusHistory.created_at)
+    """Получить историю статусов заказа с безопасной обработкой ошибок"""
+    try:
+        history = list(
+            db.scalars(
+                select(OrderStatusHistory)
+                .where(OrderStatusHistory.order_id == order_id)
+                .order_by(OrderStatusHistory.created_at)
+            )
         )
-    )
+        return history
+    except Exception as e:
+        import traceback
+        print(f"Error getting status history for order {order_id}: {e}")
+        print(traceback.format_exc())
+        return []
 
 
 def create_calendar_event(
@@ -611,11 +604,20 @@ def update_visit(
     return event
 
 
-def get_executor_calendar(db: Session, executor_id: uuid.UUID) -> list[ExecutorCalendarEvent]:
-    return list(
-        db.scalars(
-            select(ExecutorCalendarEvent).where(
-                ExecutorCalendarEvent.executor_id == executor_id
+def get_executor_calendar(db: Session, executor_id: uuid.UUID | None) -> list[ExecutorCalendarEvent]:
+    """
+    Получить календарь исполнителя.
+    Если executor_id = None (для суперадмина), возвращает все события календаря.
+    """
+    if executor_id is None:
+        # Для суперадмина - все события
+        return list(db.scalars(select(ExecutorCalendarEvent)))
+    else:
+        # Для обычного исполнителя - только его события
+        return list(
+            db.scalars(
+                select(ExecutorCalendarEvent).where(
+                    ExecutorCalendarEvent.executor_id == executor_id
+                )
             )
         )
-    )

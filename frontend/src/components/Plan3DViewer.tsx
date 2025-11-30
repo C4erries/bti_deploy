@@ -1,7 +1,7 @@
 import { Canvas, useThree, type ThreeEvent } from '@react-three/fiber';
 import { Grid, OrbitControls, Stats, TransformControls } from '@react-three/drei';
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
-import { Box3, DoubleSide, Group, Mesh, Shape, Vector3 } from 'three';
+import { Box3, DoubleSide, Group, Mesh, Shape, Texture, TextureLoader, Vector3 } from 'three';
 import type { OrbitControls as OrbitControlsImpl, TransformControls as TransformControlsImpl } from 'three-stdlib';
 import type { PlanGeometry, PlanObject3D } from '../types';
 import {
@@ -11,7 +11,7 @@ import {
   getPxPerMeter,
   safeNumber,
 } from '../utils/plan3d';
-import type { ZonePolygon3D } from '../utils/plan3d';
+import type { ZonePolygon3D, WallSegment3D } from '../utils/plan3d';
 import { buttonClass, cardClass, inputClass, subtleButtonClass } from './ui';
 
 export interface Plan3DViewerProps {
@@ -19,10 +19,39 @@ export interface Plan3DViewerProps {
   onPlanChange: (plan: PlanGeometry) => void;
 }
 
-const WALL_HEIGHT = 2.7;
+const DEFAULT_WALL_HEIGHT = 2.7;
 const DEFAULT_OBJECT_SIZE = { x: 2, y: 0.8, z: 1 };
 
-const zoneColorByType = (zoneType?: string) => {
+const useOptionalTexture = (textureUrl?: string | null) => {
+  const [texture, setTexture] = useState<Texture | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    if (!textureUrl) {
+      setTexture(null);
+      return;
+    }
+    const loader = new TextureLoader();
+    loader.load(
+      textureUrl,
+      (loaded) => {
+        if (active) setTexture(loaded);
+      },
+      undefined,
+      () => {
+        if (active) setTexture(null);
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [textureUrl]);
+
+  return texture;
+};
+
+const zoneColorByType = (zoneType?: string, styleColor?: string | null) => {
+  if (styleColor) return styleColor;
   switch (zoneType) {
     case 'kitchen':
       return '#f59e0b';
@@ -38,8 +67,8 @@ const zoneColorByType = (zoneType?: string) => {
 };
 
 const Ground = ({ width, height }: { width: number; height: number }) => (
-  <group>
-    <mesh rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
+  <group position={[width / 2, 0, height / 2]}>
+    <mesh rotation={[Math.PI / 2, 0, 0]} receiveShadow>
       <planeGeometry args={[width, height]} />
       <meshStandardMaterial color="#f9fafb" />
     </mesh>
@@ -55,21 +84,30 @@ const Ground = ({ width, height }: { width: number; height: number }) => (
   </group>
 );
 
+const WallMesh = ({ wall, height }: { wall: WallSegment3D; height: number }) => {
+  const texture = useOptionalTexture(wall.style?.textureUrl ?? null);
+  const color = wall.style?.color ?? (wall.loadBearing ? '#475569' : '#9ca3af');
+
+  return (
+    <mesh
+      position={[wall.center.x, height / 2, wall.center.z]}
+      rotation={[0, wall.angle, 0]}
+      castShadow
+      receiveShadow
+    >
+      <boxGeometry args={[wall.length, height, wall.thickness]} />
+      <meshStandardMaterial color={color} map={texture ?? undefined} />
+    </mesh>
+  );
+};
+
 const Walls = ({ plan }: { plan: PlanGeometry }) => {
   const walls = useMemo(() => buildWallSegments(plan), [plan]);
+  const wallHeight = plan.meta?.ceiling_height_m ?? DEFAULT_WALL_HEIGHT;
   return (
     <group>
       {walls.map((wall) => (
-        <mesh
-          key={wall.id}
-          position={[wall.center.x, WALL_HEIGHT / 2, wall.center.z]}
-          rotation={[0, wall.angle, 0]}
-          castShadow
-          receiveShadow
-        >
-          <boxGeometry args={[wall.length, WALL_HEIGHT, wall.thickness]} />
-          <meshStandardMaterial color={wall.loadBearing ? '#475569' : '#9ca3af'} />
-        </mesh>
+        <WallMesh key={wall.id} wall={wall} height={wallHeight} />
       ))}
     </group>
   );
@@ -84,12 +122,15 @@ const ZoneMesh = ({ zone }: { zone: ZonePolygon3D }) => {
     });
     return s;
   }, [zone]);
+  const texture = useOptionalTexture(zone.style?.textureUrl ?? null);
+  const color = zoneColorByType(zone.zoneType, zone.style?.color ?? null);
 
   return (
-    <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.001, 0]} receiveShadow>
+    <mesh rotation={[Math.PI / 2, 0, 0]} position={[0, 0.001, 0]} receiveShadow>
       <shapeGeometry args={[shape]} />
       <meshStandardMaterial
-        color={zoneColorByType(zone.zoneType)}
+        color={color}
+        map={texture ?? undefined}
         transparent
         opacity={0.75}
         side={DoubleSide}
@@ -129,9 +170,9 @@ const PlanObjectMesh = ({
   const transformRef = useRef<TransformControlsImpl>(null);
   const orbitControls = useThree((state) => state.controls) as OrbitControlsImpl | null;
 
-  const size = obj.size || DEFAULT_OBJECT_SIZE;
-  const position = obj.position || { x: 0, y: size.y / 2, z: 0 };
-  const rotationY = obj.rotation?.y || 0;
+  const size = obj.size ?? DEFAULT_OBJECT_SIZE;
+  const position = obj.position ?? { x: 0, y: size.y / 2, z: 0 };
+  const rotationY = obj.rotation?.y ?? 0;
   const color = selected ? '#2563eb' : '#94a3b8';
 
   const handleTransformChange = useCallback(() => {
@@ -140,7 +181,7 @@ const PlanObjectMesh = ({
     onObjectChange({
       ...obj,
       position: { x: pos.x, y: pos.y, z: pos.z },
-      rotation: { ...obj.rotation, y: rotation.y },
+      rotation: { ...(obj.rotation ?? {}), y: rotation.y },
     });
   }, [obj, onObjectChange]);
 
@@ -220,6 +261,77 @@ const SceneContent = ({
   const width = safeNumber(plan.meta?.width, 1000) / pxPerMeter;
   const height = safeNumber(plan.meta?.height, 1000) / pxPerMeter;
   const objects = plan.objects3d || [];
+  
+  // Вычисляем центр плана для центрирования сцены
+  const sceneCenter = useMemo(() => {
+    const walls = buildWallSegments(plan);
+    const zones = buildZonePolygons(plan);
+    
+    // Собираем все точки для вычисления bounding box
+    const allPoints: { x: number; z: number }[] = [];
+    
+    // Точки из стен
+    walls.forEach(wall => {
+      allPoints.push(wall.p1, wall.p2);
+    });
+    
+    // Точки из зон
+    zones.forEach(zone => {
+      allPoints.push(...zone.points);
+    });
+    
+    // Точки из 3D объектов (если они уже в метрах)
+    objects.forEach(obj => {
+      if (obj.position) {
+        allPoints.push({ x: obj.position.x, z: obj.position.z });
+      }
+    });
+    
+    // Добавляем углы плана для правильного центрирования
+    const planCenter2D = from2DTo3D(
+      safeNumber(plan.meta?.width, 0) / 2,
+      safeNumber(plan.meta?.height, 0) / 2,
+      pxPerMeter
+    );
+    allPoints.push(planCenter2D);
+    
+    // Добавляем углы плана
+    const corners = [
+      from2DTo3D(0, 0, pxPerMeter),
+      from2DTo3D(safeNumber(plan.meta?.width, 0), 0, pxPerMeter),
+      from2DTo3D(0, safeNumber(plan.meta?.height, 0), pxPerMeter),
+      from2DTo3D(safeNumber(plan.meta?.width, 0), safeNumber(plan.meta?.height, 0), pxPerMeter),
+    ];
+    allPoints.push(...corners);
+    
+    // Вычисляем bounding box
+    let minX = Infinity, maxX = -Infinity;
+    let minZ = Infinity, maxZ = -Infinity;
+    
+    allPoints.forEach(pt => {
+      minX = Math.min(minX, pt.x);
+      maxX = Math.max(maxX, pt.x);
+      minZ = Math.min(minZ, pt.z);
+      maxZ = Math.max(maxZ, pt.z);
+    });
+    
+    // Если нет точек, используем размеры плана
+    if (allPoints.length === 0 || !isFinite(minX)) {
+      const planCenter2D = from2DTo3D(
+        safeNumber(plan.meta?.width, 0) / 2,
+        safeNumber(plan.meta?.height, 0) / 2,
+        pxPerMeter
+      );
+      return { x: planCenter2D.x, z: planCenter2D.z };
+    }
+    
+    // Центр bounding box
+    return {
+      x: (minX + maxX) / 2,
+      z: (minZ + maxZ) / 2,
+    };
+  }, [plan, width, height, objects, pxPerMeter]);
+  
   const fitKey = useMemo(
     () => JSON.stringify({ w: plan.meta?.width, h: plan.meta?.height, el: (plan.elements || []).map((e) => e.id) }),
     [plan.meta?.height, plan.meta?.width, plan.elements],
@@ -249,7 +361,7 @@ const SceneContent = ({
   }, [camera, controls, fitKey]);
 
   return (
-    <group ref={groupRef}>
+    <group ref={groupRef} position={[-sceneCenter.x, 0, -sceneCenter.z]}>
       <Ground width={width} height={height} />
       <Walls plan={plan} />
       <Zones plan={plan} />
@@ -272,7 +384,7 @@ const SceneContent = ({
 const Plan3DViewer = ({ plan, onPlanChange }: Plan3DViewerProps) => {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [controlsMode, setControlsMode] = useState<'translate' | 'rotate'>('translate');
-  const [newType, setNewType] = useState('sofa');
+  const [newType, setNewType] = useState<PlanObject3D['type']>('chair');
   const pxPerMeter = getPxPerMeter(plan);
 
   const addObject = () => {
@@ -308,8 +420,8 @@ const Plan3DViewer = ({ plan, onPlanChange }: Plan3DViewerProps) => {
         ? {
             ...obj,
             rotation: {
-              ...obj.rotation,
-              y: (obj.rotation?.y || 0) + (direction === 'left' ? -Math.PI / 2 : Math.PI / 2),
+              ...(obj.rotation ?? {}),
+              y: (obj.rotation?.y ?? 0) + (direction === 'left' ? -Math.PI / 2 : Math.PI / 2),
             },
           }
         : obj,
@@ -339,13 +451,13 @@ const Plan3DViewer = ({ plan, onPlanChange }: Plan3DViewerProps) => {
             <select
               className={inputClass}
               value={newType}
-              onChange={(e) => setNewType(e.target.value)}
+              onChange={(e) => setNewType(e.target.value as PlanObject3D['type'])}
             >
-              <option value="sofa">Sofa</option>
-              <option value="table">Table</option>
-              <option value="wardrobe">Wardrobe</option>
-              <option value="bed">Bed</option>
-              <option value="chair">Chair</option>
+              <option value="chair">Стул</option>
+              <option value="table">Стол</option>
+              <option value="bed">Кровать</option>
+              <option value="window">Окно</option>
+              <option value="door">Дверь</option>
             </select>
             <button className={buttonClass} onClick={addObject}>
               Добавить

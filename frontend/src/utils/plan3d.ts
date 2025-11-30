@@ -1,20 +1,26 @@
-import type { PlanGeometry, PlanObject3D, WallElement, ZoneElement } from '../types';
+import type {
+  ElementStyle,
+  PlanGeometry,
+  PlanObject3D,
+  WallElement,
+  ZoneElement,
+} from '../types';
 
 export const safeNumber = (value: unknown, fallback = 0) => {
   const num = Number(value);
   return Number.isFinite(num) ? num : fallback;
 };
 
-export const getPxPerMeter = (plan?: PlanGeometry) =>
-  plan?.meta?.scale?.px_per_meter && plan.meta.scale.px_per_meter > 0
-    ? plan.meta.scale.px_per_meter
-    : 100;
+export const getPxPerMeter = (plan?: PlanGeometry) => {
+  const scale = plan?.meta?.scale;
+  return scale && scale.px_per_meter > 0 ? scale.px_per_meter : 100;
+};
 
 export const from2DTo3D = (xPx: number, yPx: number, pxPerMeter: number) => {
   const scale = pxPerMeter > 0 ? pxPerMeter : 100;
   return {
     x: safeNumber(xPx, 0) / scale,
-    z: -safeNumber(yPx, 0) / scale,
+    z: safeNumber(yPx, 0) / scale,
   };
 };
 
@@ -28,6 +34,7 @@ export interface WallSegment3D {
   loadBearing: boolean;
   role: WallElement['role'];
   angle: number;
+  style?: ElementStyle | null;
 }
 
 export const buildWallSegments = (plan: PlanGeometry): WallSegment3D[] => {
@@ -63,6 +70,7 @@ export const buildWallSegments = (plan: PlanGeometry): WallSegment3D[] => {
         loadBearing: !!wall.loadBearing,
         role: wall.role,
         angle,
+        style: wall.style,
       };
     })
     .filter((wall) => wall.length > 0.0001);
@@ -72,6 +80,7 @@ export interface ZonePolygon3D {
   id: string;
   zoneType?: string;
   points: { x: number; z: number }[];
+  style?: ElementStyle | null;
 }
 
 export const buildZonePolygons = (plan: PlanGeometry): ZonePolygon3D[] => {
@@ -92,7 +101,7 @@ export const buildZonePolygons = (plan: PlanGeometry): ZonePolygon3D[] => {
         const y = raw[i + 1];
         points.push(from2DTo3D(x, y, pxPerMeter));
       }
-      return { id: zone.id, zoneType: zone.zoneType, points };
+      return { id: zone.id, zoneType: zone.zoneType, points, style: zone.style };
     })
     .filter((zone) => zone.points.length >= 3);
 };

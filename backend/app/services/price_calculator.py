@@ -2,22 +2,24 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
-from app.models.directory import District, HouseType, Service
+from app.models.directory import District, HouseType
 from app.models.order import Order
 from app.schemas.pricing import PriceBreakdown
 
 
 def calculate_price(
     db: Session,
-    service_code: int,
     district_code: str | None,
     house_type_code: str | None,
     calculator_input: dict | None,
 ) -> tuple[float, PriceBreakdown]:
-    calc = calculator_input or {}
+    calc = dict(calculator_input or {})
 
-    service = db.get(Service, service_code) if service_code else None
-    base = float(service.base_price) if service and service.base_price is not None else 0.0
+    # Backward compatibility: старые заказы могли присылать hasBasement на верхнем уровне
+    features = dict(calc.get("features") or {})
+    if "hasBasement" in calc and "basement" not in features:
+        features["basement"] = bool(calc.get("hasBasement"))
+    calc["features"] = features
 
     district_coef = 1.0
     if district_code:
@@ -31,7 +33,7 @@ def calculate_price(
         if house and house.price_coef is not None:
             house_coef = float(house.price_coef)
 
-    base_component = base * district_coef * house_coef
+    base_component = 0.0
 
     area = float(calc.get("area") or 0)
     price_per_m2 = 500.0
@@ -56,10 +58,11 @@ def calculate_price(
     if calc.get("urgent"):
         coef_features *= 1.3
 
-    estimated = (base_component + works_component) * coef_features
+    # район и тип дома влияют на общую стоимость
+    estimated = (base_component + works_component) * coef_features * district_coef * house_coef
     breakdown = PriceBreakdown(
         baseComponent=round(base_component, 2),
-        worksComponent=round(works_component, 2),
+        worksComponent=round(works_component * district_coef * house_coef, 2),
         featuresCoef=round(coef_features, 2),
         raw=calc,
     )
@@ -74,7 +77,6 @@ def calculate_order_price(
     try:
         estimated, _ = calculate_price(
             db=db,
-            service_code=order.service_code,
             district_code=order.district_code,
             house_type_code=order.house_type_code,
             calculator_input=calculator_input or {},
